@@ -1,38 +1,15 @@
 // Parsing utilities for LLM output
-import type { TaskEntry } from "./task-manager.js";
+export {
+  parseJsonTaskList,
+  snippetForLog,
+  PLAN_PARSE_RETRY_INSTRUCTION,
+} from "../shared/parseTaskList.js";
 
 export interface ParsedBlockedInfo {
   summary: string;
   impact: string;
   nextStep: string;
   needs: string;
-}
-
-export function parseJsonTaskList(
-  content: string
-): Pick<TaskEntry, "id" | "title" | "description" | "status">[] {
-  const m = content.match(/```[Jj][Ss][Oo][Nn]\s*\n([\s\S]*?)\n```/);
-  if (!m) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(m[1]);
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(parsed)) return [];
-  const results: Pick<TaskEntry, "id" | "title" | "description" | "status">[] = [];
-  for (const item of parsed) {
-    if (item === null || typeof item !== "object") continue;
-    const obj = item as Record<string, unknown>;
-    if (typeof obj["id"] !== "number" || typeof obj["title"] !== "string" || !obj["title"]) continue;
-    results.push({
-      id: obj["id"] as number,
-      title: (obj["title"] as string).trim(),
-      description: typeof obj["description"] === "string" && obj["description"] ? obj["description"] : "",
-      status: typeof obj["status"] === "string" && obj["status"] ? obj["status"] : "backlog",
-    });
-  }
-  return results;
 }
 
 export function parseTaskId(content: string): number | null {
@@ -78,4 +55,20 @@ export function parseBlockedInfo(content: string): ParsedBlockedInfo {
     nextStep: readTag(content, "blocked-next-step"),
     needs: readTag(content, "blocked-needs"),
   };
+}
+
+/**
+ * Parse `<research-prompt>...</research-prompt>` blocks from plan output.
+ * The plan agent can emit one or more of these to request parallel research
+ * sub-jobs when `dockerPlanParallel` is enabled.
+ */
+export function parseResearchPrompts(content: string): string[] {
+  const prompts: string[] = [];
+  const re = /<research-prompt>([\s\S]*?)<\/research-prompt>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    const p = m[1].trim();
+    if (p) prompts.push(p);
+  }
+  return prompts;
 }

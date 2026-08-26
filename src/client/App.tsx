@@ -1,10 +1,10 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { useRalph } from "./hooks/useRalph";
 import { KanbanColumn } from "./components/KanbanColumn";
 import { ControlPanel } from "./components/ControlPanel";
 import { LogViewer } from "./components/LogViewer";
 import { ErrorBanner } from "./components/ErrorBanner";
-import { COLUMNS, groupTasks, sortTasks } from "./types";
+import { COLUMNS, groupTasks, sortTasksForColumn, formatInFlightHeader, type Settings } from "./types";
 import "./App.css";
 
 const STATUS_LABELS: Record<string, string> = {
@@ -17,11 +17,13 @@ const STATUS_LABELS: Record<string, string> = {
 export default function App() {
   const ralph = useRalph();
   const [showSettings, setShowSettings] = useState(false);
+  const setupOpenedRef = useRef(false);
   const [showLog, setShowLog] = useState(false);
   const [errorDismissed, setErrorDismissed] = useState(false);
   const [panelWidth, setPanelWidth] = useState(400);
   const panelWidthRef = useRef(400);
   panelWidthRef.current = panelWidth;
+  const [settingsDraft, setSettingsDraft] = useState<Settings>(ralph.settings);
 
   const startResize = useCallback((e: React.MouseEvent) => {
     const startX = e.clientX;
@@ -54,8 +56,28 @@ export default function App() {
     ralph.readiness.repoConfigured &&
     ralph.readiness.requirementsFound &&
     ralph.readiness.epicConfigured;
-  const settingsVisible = showSettings || !isReady;
-  const canStart = isReady && !isRunning;
+  useEffect(() => {
+    if (!isReady && !setupOpenedRef.current) {
+      setupOpenedRef.current = true;
+      setShowSettings(true);
+    }
+  }, [isReady]);
+  const settingsVisible = showSettings;
+
+  useEffect(() => {
+    if (!settingsVisible) {
+      setSettingsDraft(ralph.settings);
+    }
+  }, [ralph.settings, settingsVisible]);
+  const dockerBlocksStart =
+    settingsDraft.useDocker && ralph.readiness.dockerHostOk === false;
+  const canStart = isReady && !isRunning && !dockerBlocksStart;
+
+  async function handleStart() {
+    setErrorDismissed(false);
+    setShowLog(true);
+    await ralph.saveSettingsAndStart(settingsDraft);
+  }
 
   function handleRestart() {
     setErrorDismissed(false);
@@ -80,7 +102,9 @@ export default function App() {
         <div className="app-header__stats">
           <div className="stat">
             <span className="stat__label">Task</span>
-            <span className="stat__value">#{ralph.tasks.currentTaskNum || 0}</span>
+            <span className="stat__value">
+              {formatInFlightHeader(ralph.tasks.tasks, ralph.tasks.currentTaskNum)}
+            </span>
           </div>
           <div className="stat">
             <span className="stat__label">LLM Calls</span>
@@ -106,9 +130,15 @@ export default function App() {
             ) : (
               <button
                 className="loop-btn loop-btn--start"
-                onClick={ralph.startLoop}
+                onClick={() => void handleStart()}
                 disabled={!canStart}
-                title={!isReady ? "Configure repository, requirements, and epic first" : undefined}
+                title={
+                  !isReady
+                    ? "Configure repository, requirements, and epic first"
+                    : dockerBlocksStart
+                      ? ralph.readiness.dockerHostError ?? "Docker is not ready"
+                      : undefined
+                }
               >
                 Start
               </button>
@@ -131,7 +161,7 @@ export default function App() {
           </button>
           <button
             className={`icon-btn ${settingsVisible ? "icon-btn--active" : ""}`}
-            onClick={() => setShowSettings(!settingsVisible)}
+            onClick={() => setShowSettings(!showSettings)}
             title="Settings"
           >
             {"\u2699"}
@@ -169,7 +199,11 @@ export default function App() {
             <KanbanColumn
               key={col.key}
               column={col}
-              tasks={sortTasks(groups[col.key] || [], ralph.settings.taskColumnSort)}
+              tasks={sortTasksForColumn(
+                col.key,
+                groups[col.key] || [],
+                settingsDraft.taskColumnSort,
+              )}
             />
           ))}
         </main>
@@ -179,6 +213,7 @@ export default function App() {
             <div className="cp-resize-handle" onMouseDown={startResize} />
             <ControlPanel
               settings={ralph.settings}
+              onSettingsDraftChange={setSettingsDraft}
               epic={ralph.epic}
               prompts={ralph.prompts}
               repoRoot={ralph.repoRoot}
@@ -188,6 +223,10 @@ export default function App() {
               onSavePrompt={ralph.savePrompt}
               onSetRepo={ralph.setRepo}
               onRefreshBacklog={ralph.refreshBacklog}
+              onSetEpicFile={ralph.setEpicFile}
+              onCreateEpicFile={ralph.createEpicFile}
+              onValidateDocker={ralph.validateDocker}
+              onMergeEpicWork={ralph.mergeEpicWork}
               isRunning={isRunning}
               onClose={() => setShowSettings(false)}
             />
@@ -196,7 +235,14 @@ export default function App() {
       </div>
 
       {showLog && (
-        <LogViewer lines={ralph.log} onClose={() => setShowLog(false)} />
+        <LogViewer
+          lines={ralph.log}
+          currentTaskNum={ralph.tasks.currentTaskNum}
+          currentTaskTitle={
+            ralph.tasks.tasks.find((t) => t.id === ralph.tasks.currentTaskNum)?.title
+          }
+          onClose={() => setShowLog(false)}
+        />
       )}
     </div>
   );

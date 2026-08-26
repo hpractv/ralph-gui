@@ -54,7 +54,11 @@ export interface LoopStatus {
   error: string | null;
 }
 
-export type AgentBackendId = "copilot" | "cursor-agent" | "claude" | "gemini";
+export type AgentBackendId = "copilot" | "cursor-agent" | "claude" | "gemini" | "opencode";
+
+export type DockerMergeStrategy = "work-branch" | "epic-base-per-task";
+
+export type CopilotOutputFormat = "text" | "json" | "streaming";
 
 export type TaskColumnSort =
   | "updatedAtAsc"
@@ -73,10 +77,31 @@ export interface Settings {
   planFrequency: number;
   minBacklogSize: number;
   agentBackend: AgentBackendId;
+  fleetMode: boolean;
+  useDocker: boolean;
+  dockerComposeFile: string;
+  dockerService: string;
+  epicBaseBranch: string;
+  dockerWorkBranch: string;
+  dockerIsolateBranch: boolean;
+  dockerMergeStrategy: DockerMergeStrategy;
+  dockerPoolSize: number;
+  dockerParallelTasks: boolean;
+  /** Dispatch parallel research sub-jobs during the plan phase (stretch) */
+  dockerPlanParallel: boolean;
+  dockerInstalledBackends: AgentBackendId[];
+  dockerMountSocket: boolean;
+  /** Auto-merge dockerWorkBranch into epicBaseBranch when loop finishes successfully */
+  dockerAutoMergeEpicWork: boolean;
+  /** Copilot CLI log format when agentBackend is copilot. */
+  copilotOutputFormat: CopilotOutputFormat;
   epicFile: string;
   requirementsFile: string;
   pauseAfterPlan: boolean;
   taskColumnSort: TaskColumnSort;
+  savedModelsByBackend: Partial<
+    Record<AgentBackendId, { planModel: string; devModel: string; qaModel: string }>
+  >;
 }
 
 export interface Readiness {
@@ -85,6 +110,8 @@ export interface Readiness {
   requirementsFile: string | null;
   gitBranch: string;
   epicConfigured: boolean;
+  dockerHostOk?: boolean;
+  dockerHostError?: string;
 }
 
 export type ServerMessage =
@@ -114,6 +141,26 @@ export function groupTasks(tasks: Task[]): Record<TaskStatusValue, Task[]> {
   return groups;
 }
 
+/** Tasks currently on the board (dev, QA, or blocked). */
+export function inFlightTasks(tasks: Task[]): Task[] {
+  return tasks.filter(
+    (t) => t.status === "inProgress" || t.status === "inQa" || t.status === "blocked",
+  );
+}
+
+export function formatInFlightHeader(tasks: Task[], fallbackTaskNum = 0): string {
+  const inflight = inFlightTasks(tasks);
+  if (inflight.length === 0) {
+    const fallback = tasks.find((t) => t.id === fallbackTaskNum);
+    if (fallback && fallback.status !== "done") return `#${fallbackTaskNum}`;
+    return "#0";
+  }
+  if (inflight.length === 1) {
+    return `#${inflight[0]!.id}`;
+  }
+  return inflight.map((t) => `#${t.id}`).join(" ");
+}
+
 export function sortTasks(tasks: Task[], taskColumnSort: TaskColumnSort): Task[] {
   const sorted = [...tasks];
   sorted.sort((a, b) => {
@@ -137,6 +184,15 @@ export function sortTasks(tasks: Task[], taskColumnSort: TaskColumnSort): Task[]
     }
   });
   return sorted;
+}
+
+/** Backlog is always numeric id order; other columns use the project sort setting. */
+export function sortTasksForColumn(
+  columnKey: TaskStatusValue,
+  tasks: Task[],
+  taskColumnSort: TaskColumnSort,
+): Task[] {
+  return sortTasks(tasks, columnKey === "backlog" ? "idAsc" : taskColumnSort);
 }
 
 export const COLUMNS: ColumnDef[] = [

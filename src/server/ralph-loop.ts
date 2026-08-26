@@ -8,15 +8,31 @@ import {
   DEFAULT_EPIC,
 } from "./templates.js";
 import { TaskManager, type StatusData } from "./task-manager.js";
-import { LLMCaller } from "./llm-caller.js";
+import { LLMCaller, type LLMCallOpts } from "./llm-caller.js";
+import { copilotAgentUsesJsonlLog } from "../shared/copilotLogFormat.js";
 import {
   parseRemainingTasks,
   parseBlockedInfo,
   parseJsonTaskList,
+  parseResearchPrompts,
+  snippetForLog,
+  PLAN_PARSE_RETRY_INSTRUCTION,
 } from "./parse-output.js";
 import { RalphFileManager } from "./ralph-file-manager.js";
 import { SettingsManager, DEFAULT_SETTINGS, type Settings } from "./settings-manager.js";
 import { GitManager } from "./git-manager.js";
+import {
+  checkDockerHost,
+  ensureDockerAgentRunning,
+  resolveComposeFile,
+  resolveDockerSocketPath,
+} from "./docker-runner.js";
+import { DockerPool, ensureDockerPool } from "./docker-pool.js";
+import {
+  isProtectedEpicBaseBranch,
+  mergesPerTaskToEpicBase,
+  usesWorkBranchStaging,
+} from "../shared/docker-merge-strategy.js";
 
 const DEFAULT_EPIC_NORMALIZED = DEFAULT_EPIC.replace(/\r\n/g, "\n").trim();
 
@@ -42,6 +58,11 @@ export class RalphLoop {
   private gitManager: GitManager;
   private llmCaller: LLMCaller;
   private completedEpic = false;
+  private dockerPool: DockerPool | null = null;
+  /** When true, per-task merges into epic base are paused after a conflict. */
+  private epicBaseMergePaused = false;
+  /** Simple async mutex for TaskManager writes during parallel execution. */
+  private taskWriteLock: Promise<void> = Promise.resolve();
 
   constructor(repoRoot: string, callbacks: LoopCallbacks) {
     this.repoRoot = path.resolve(repoRoot);
@@ -51,7 +72,7 @@ export class RalphLoop {
     this.fileManager = new RalphFileManager(this.ralphDir);
     this.settingsManager = new SettingsManager(this.ralphDir);
     this.gitManager = new GitManager(this.repoRoot);
-    this.llmCaller = new LLMCaller(() => this.running);
+    this.llmCaller = new LLMCaller(() => this.running, (line) => this.cb.onLog(line));
   }
 
   get isRunning() {
@@ -73,6 +94,44 @@ export class RalphLoop {
 
   get didCompleteEpic() {
     return this.completedEpic;
+  }
+
+  private buildLlmCallOpts(s: Settings, phase: "plan" | "dev" | "qa" | "backlog", slot?: { containerIndex?: number; worktreeCwd?: string }): LLMCallOpts {
+    const tag = phase === "backlog" ? "plan" : phase;
+    return {
+      agentBackend: s.agentBackend,
+      phase: tag,
+      copilotOutputFormat: s.copilotOutputFormat,
+      reasoningEffort:
+        phase === "dev"
+          ? s.devReasoningEffort
+          : phase === "qa"
+            ? s.qaReasoningEffort
+            : undefined,
+      fleetMode: phase === "dev" || phase === "qa" ? s.fleetMode : false,
+      useDocker: s.useDocker,
+      dockerComposeFile: s.dockerComposeFile,
+      dockerService: s.dockerService,
+      dockerContainerIndex: slot?.containerIndex,
+      dockerWorktreeCwd: slot?.worktreeCwd,
+      onProgress: (line, stream) => {
+        const suffix = stream === "stderr" ? " (stderr)" : "";
+        const scope = s.useDocker
+          ? slot?.containerIndex != null ? `docker:slot${slot.containerIndex}` : "docker"
+          : s.agentBackend;
+        this.cb.onLog(`[${tag}/${scope}]${suffix} ${line}`);
+      },
+    };
+  }
+
+  /** Run `fn` exclusively — queued writes to TaskManager use this to avoid races. */
+  private withTaskLock<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.taskWriteLock.then(() => fn());
+    this.taskWriteLock = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
   // --- Git helpers ---
@@ -139,18 +198,144 @@ export class RalphLoop {
       };
     }
 
+    // Docker pre-flight check
+    const settings = await this.settingsManager.read();
+    if (settings.useDocker) {
+      const dockerCheck = await checkDockerHost();
+      if (!dockerCheck.ok) {
+        this.cb.onLog(`[system] Docker check failed: ${dockerCheck.message}`);
+        return { ok: false, error: dockerCheck.message };
+      }
+
+      const composeFile = resolveComposeFile(settings, this.repoRoot);
+      const service = settings.dockerService || "ralph-agent";
+      const poolSize = settings.dockerPoolSize ?? 1;
+      const ensure = await ensureDockerAgentRunning(
+        composeFile,
+        service,
+        this.repoRoot,
+        (line) => this.cb.onLog(line),
+        settings.agentBackend,
+        {
+          installedBackends: settings.dockerInstalledBackends,
+          validateSocketMount: settings.dockerMountSocket,
+          dockerSocketPath: resolveDockerSocketPath(),
+        },
+      );
+      if (!ensure.ok) {
+        this.cb.onLog(`[system] ${ensure.message}`);
+        return { ok: false, error: ensure.message };
+      }
+      if (ensure.missingClis?.length) {
+        this.cb.onLog(
+          `[system] Warning: the following CLIs are not installed in the image: ${ensure.missingClis.join(", ")}. Rebuild with the appropriate INSTALL_* build args.`,
+        );
+      }
+
+      // If pool > 1, scale the service and initialize the pool allocator.
+      if (poolSize > 1 && (settings.dockerParallelTasks || settings.dockerPlanParallel)) {
+        this.cb.onLog(`[system] Scaling Docker pool to ${poolSize} containers…`);
+        try {
+          await ensureDockerPool(composeFile, service, poolSize, this.repoRoot);
+        } catch (err) {
+          return { ok: false, error: `Failed to scale Docker pool: ${String(err)}` };
+        }
+        this.dockerPool = new DockerPool(poolSize);
+        this.dockerPool.init();
+        this.cb.onLog(`[system] Docker pool ready (${poolSize} slots).`);
+      }
+
+      // Capture epic base branch and optionally create work branch
+      const currentBranch = await this.gitManager.getCurrentBranch();
+      const hasCommits = await this.gitManager.hasAnyCommits();
+      if (!hasCommits) {
+        const branchHint = currentBranch ? ` on branch '${currentBranch}'` : "";
+        return {
+          ok: false,
+          error:
+            `Repository has no commits yet${branchHint}. ` +
+            "Create an initial commit before starting with Docker.",
+        };
+      }
+      if (!currentBranch || currentBranch === "HEAD") {
+        return {
+          ok: false,
+          error: "Repository is in detached HEAD state. Check out a branch before starting with Docker.",
+        };
+      }
+
+      const epicBaseBranch = currentBranch;
+      let dockerWorkBranch = settings.dockerWorkBranch;
+      const perTaskToEpicBase = mergesPerTaskToEpicBase(settings);
+
+      if (perTaskToEpicBase) {
+        if (await this.gitManager.hasMergeInProgress()) {
+          return {
+            ok: false,
+            error:
+              `Branch '${epicBaseBranch}' has a merge in progress. ` +
+              "Resolve or abort the merge before starting the loop.",
+          };
+        }
+        if (isProtectedEpicBaseBranch(epicBaseBranch)) {
+          this.cb.onLog(
+            `[system] Warning: epic base branch is '${epicBaseBranch}'. ` +
+            "Per-task merges will land directly on this branch. Prefer a dedicated integration branch.",
+          );
+        }
+        try {
+          await this.gitManager.createOrCheckoutBranch(epicBaseBranch, epicBaseBranch);
+          this.cb.onLog(
+            `[system] Merge strategy: per-task into epic base (${epicBaseBranch}). ` +
+            "Parallel slots merge after each task completes.",
+          );
+        } catch (err) {
+          return {
+            ok: false,
+            error: `Failed to check out epic base branch '${epicBaseBranch}': ${String(err)}`,
+          };
+        }
+        dockerWorkBranch = "";
+      } else if (usesWorkBranchStaging(settings)) {
+        // Generate a deterministic work branch name if not already set
+        if (!dockerWorkBranch || dockerWorkBranch === currentBranch) {
+          const epicSlug = path.basename(settings.epicFile || "epic").replace(/\.[^.]+$/, "");
+          const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+          dockerWorkBranch = `ralph/epic-${epicSlug}-${dateStr}`;
+        }
+        try {
+          await this.gitManager.createOrCheckoutBranch(dockerWorkBranch, epicBaseBranch);
+          this.cb.onLog(`[system] Work branch: ${dockerWorkBranch} (base: ${epicBaseBranch})`);
+        } catch (err) {
+          return {
+            ok: false,
+            error: `Failed to create work branch '${dockerWorkBranch}': ${String(err)}`,
+          };
+        }
+      }
+
+      // Persist captured branch info to settings
+      await this.settingsManager.write({
+        ...settings,
+        epicBaseBranch,
+        dockerWorkBranch: usesWorkBranchStaging(settings) ? dockerWorkBranch : "",
+      });
+    }
+
     const runId = ++this.runGeneration;
+    this.epicBaseMergePaused = false;
     this.running = true;
     this.completedEpic = false;
     this.stopRequestedRunId = null;
     this.cb.onLoopStatus("running", null);
-    this.cb.onLog(`[system] Ralph loop started (requirements: ${reqFile})`);
+    this.cb.onLog(`[ralph] Ralph loop started (requirements: ${reqFile})`);
 
     // Run in background — don't await
     const runPromise = this.runLoop();
     this.activeRunPromise = runPromise;
     runPromise
-      .then(() => {
+      .then(async () => {
+        await this.autoMergeOnFinish(runId);
         this.finishRun(runId);
       })
       .catch((err: Error) => {
@@ -170,8 +355,10 @@ export class RalphLoop {
     this.stopRequestedRunId = this.runGeneration;
     this.running = false;
     this.llmCaller.stop();
+    this.dockerPool?.stopAll();
+    this.dockerPool = null;
     this.cb.onLoopStatus("stopped", null);
-    this.cb.onLog("[system] Ralph loop stopped by user");
+    this.cb.onLog("[ralph] Ralph loop stopped by user");
     return { ok: true };
   }
 
@@ -205,7 +392,7 @@ export class RalphLoop {
     }
 
     this.refreshing = true;
-    this.cb.onLog("[system] Refreshing backlog...");
+    this.cb.onLog("[ralph] Refreshing backlog...");
 
     try {
       await this.bootstrap();
@@ -222,7 +409,7 @@ export class RalphLoop {
         fullPlanPrompt,
         settings.planModel,
         this.repoRoot,
-        { agentBackend: settings.agentBackend }
+        this.buildLlmCallOpts(settings, "backlog"),
       );
 
       if (output.includes("<status>complete</status>")) {
@@ -230,26 +417,36 @@ export class RalphLoop {
         const data = await this.taskManager.readStatus();
         data.tasks = data.tasks.filter((t) => t.status !== "backlog");
         await this.taskManager.writeStatus(data);
-        this.cb.onLog("[system] Backlog refresh: project appears complete");
+        this.cb.onLog("[ralph] Backlog refresh: project appears complete");
       } else {
-        const parsedTasks = parseJsonTaskList(output);
-        if (parsedTasks.length > 0) {
-          await this.taskManager.syncBacklogTasks(parsedTasks);
-          this.cb.onLog(`[system] Backlog refreshed: ${parsedTasks.length} tasks`);
-        } else {
-          const remainingTasks = parseRemainingTasks(output);
-          if (remainingTasks.length > 0) {
-            await this.taskManager.syncBacklogTasksByTitle(remainingTasks);
-            this.cb.onLog(`[system] Backlog refreshed: ${remainingTasks.length} tasks`);
+        let synced = await this.persistPlanTaskList(output, "[ralph] Backlog refresh:");
+        if (synced === 0) {
+          const retryOutput = await this.llmCaller.call(
+            fullPlanPrompt + "\n---\n" + PLAN_PARSE_RETRY_INSTRUCTION,
+            settings.planModel,
+            this.repoRoot,
+            this.buildLlmCallOpts(settings, "backlog"),
+          );
+          if (retryOutput.includes("<status>complete</status>")) {
+            const data = await this.taskManager.readStatus();
+            data.tasks = data.tasks.filter((t) => t.status !== "backlog");
+            await this.taskManager.writeStatus(data);
+            this.cb.onLog("[ralph] Backlog refresh: project appears complete");
           } else {
-            this.cb.onLog("[system] Backlog refresh: no tasks parsed from output");
+            synced = await this.persistPlanTaskList(
+              retryOutput,
+              "[ralph] Backlog refresh:",
+            );
+            if (synced === 0) {
+              this.cb.onLog("[ralph] Backlog refresh: no tasks parsed from output");
+            }
           }
         }
       }
       return { ok: true };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.cb.onLog(`[system] Backlog refresh failed: ${msg}`);
+      this.cb.onLog(`[ralph] Backlog refresh failed: ${msg}`);
       return { ok: false, error: msg };
     } finally {
       this.refreshing = false;
@@ -263,6 +460,40 @@ export class RalphLoop {
     if (ms < 1000) return `${ms}ms`;
     if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
     return `${Math.floor(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
+  }
+
+  /** Parse plan stdout and write backlog. Returns how many tasks were synced. */
+  private async persistPlanTaskList(output: string, logPrefix: string): Promise<number> {
+    const parsedTaskList = parseJsonTaskList(output);
+    if (parsedTaskList.length > 0) {
+      await this.taskManager.syncBacklogTasks(parsedTaskList);
+      this.cb.onLog(
+        `${logPrefix} Synced ${parsedTaskList.length} tasks from plan output (json)`,
+      );
+      return parsedTaskList.length;
+    }
+    const remainingTasks = parseRemainingTasks(output);
+    if (remainingTasks.length > 0) {
+      await this.taskManager.syncBacklogTasksByTitle(remainingTasks);
+      this.cb.onLog(
+        `${logPrefix} Synced ${remainingTasks.length} tasks from plan output`,
+      );
+      return remainingTasks.length;
+    }
+    this.cb.onLog(
+      `[ralph] Plan output had no parseable task list — Kanban not updated. Snippet: ${snippetForLog(output)}`,
+    );
+    return 0;
+  }
+
+  private async logKanbanInFlight(): Promise<void> {
+    const data = await this.taskManager.readStatus();
+    const inflight = data.tasks.filter(
+      (t) => t.status === "inProgress" || t.status === "inQa" || t.status === "blocked",
+    );
+    if (inflight.length <= 1) return;
+    const ids = inflight.map((t) => `#${t.id} ${t.status}`).join(", ");
+    this.cb.onLog(`[ralph] Kanban: ${inflight.length} tasks in flight (${ids})`);
   }
 
   // --- Main Loop ---
@@ -301,7 +532,7 @@ export class RalphLoop {
     if (resumeTask && this.running) {
       const isQa = resumeTask.status === "inQa";
       this.cb.onLog(
-        `[system] Resuming ${isQa ? "QA" : "dev"} for task #${resumeTask.id}: ${resumeTask.title}`
+        `[ralph] Resuming ${isQa ? "QA" : "dev"} for task #${resumeTask.id}: ${resumeTask.title}`
       );
       const taskContent = `## Task: ${resumeTask.title}\n\n${resumeTask.description}`;
       await this.taskManager.setNextTaskContent(resumeTask.id, taskContent);
@@ -321,7 +552,7 @@ export class RalphLoop {
       const settings = await this.settingsManager.read();
       if (totalLLMCalls >= settings.maxLLMCalls) {
         this.cb.onLog(
-          `[system] Max LLM calls reached (${totalLLMCalls}/${settings.maxLLMCalls})`
+          `[ralph] Max LLM calls reached (${totalLLMCalls}/${settings.maxLLMCalls})`
         );
         break;
       }
@@ -340,7 +571,7 @@ export class RalphLoop {
         // Pick the first backlog task without re-planning
         const nextBacklog = currentStatus.tasks.find((t) => t.status === "backlog");
         if (nextBacklog) {
-          this.cb.onLog(`[system] Skipping plan phase (${backlogCount} backlog tasks, plan every ${settings.planFrequency} tasks)`);
+          this.cb.onLog(`[ralph] Skipping plan phase (${backlogCount} backlog tasks, plan every ${settings.planFrequency} tasks)`);
           const effectiveTaskId = nextBacklog.id;
           const title = nextBacklog.title;
 
@@ -368,7 +599,7 @@ export class RalphLoop {
         }
       }
 
-      this.cb.onLog(`[system] Planning iteration #${iteration}...`);
+      this.cb.onLog(`[ralph] Planning iteration #${iteration}...`);
       tasksSincePlan = 0;
 
       // --- Plan phase ---
@@ -380,17 +611,17 @@ export class RalphLoop {
           planPrompt,
           settings.planModel,
           this.repoRoot,
-          { agentBackend: settings.agentBackend }
+          this.buildLlmCallOpts(settings, "plan"),
         );
       } catch (err) {
         throw new Error(`Plan phase failed: ${err}`);
       }
       totalLLMCalls++;
-      this.cb.onLog(`[system] Planning iteration #${iteration} finished in ${this.elapsed(planStart)}`);
+      this.cb.onLog(`[ralph] Planning iteration #${iteration} finished in ${this.elapsed(planStart)}`);
 
       // Check if all tasks are done
       if (nextTaskContent.includes("<status>complete</status>")) {
-        this.cb.onLog(`[system] All tasks completed after ${iteration - 1} tasks.`);
+        this.cb.onLog(`[ralph] All tasks completed after ${iteration - 1} tasks.`);
         this.completedEpic = true;
         const statusData = await this.taskManager.readStatus();
         statusData.tasks = statusData.tasks.filter(
@@ -411,16 +642,87 @@ export class RalphLoop {
         break;
       }
 
-      // Sync remaining tasks from plan output to ensure backlog is preserved
-      // This acts as a fallback if the plan agent didn't write task-status.json correctly
-      const remainingTasks = parseRemainingTasks(nextTaskContent);
-      const parsedTaskList = parseJsonTaskList(nextTaskContent);
-      if (parsedTaskList.length > 0) {
-        await this.taskManager.syncBacklogTasks(parsedTaskList);
-        this.cb.onLog(`[system] Synced ${parsedTaskList.length} tasks from plan output (json)`);
-      } else if (remainingTasks.length > 0) {
-        await this.taskManager.syncBacklogTasksByTitle(remainingTasks);
-        this.cb.onLog(`[system] Synced ${remainingTasks.length} tasks from plan output`);
+      // Loop engine owns task-status.json: parse plan stdout and persist backlog.
+      let synced = await this.persistPlanTaskList(nextTaskContent, "[ralph]");
+      if (synced === 0) {
+        this.cb.onLog("[ralph] Retrying plan once with a JSON-only correction prompt.");
+        const retryStart = Date.now();
+        try {
+          nextTaskContent = await this.llmCaller.call(
+            planPrompt + "\n---\n" + PLAN_PARSE_RETRY_INSTRUCTION,
+            settings.planModel,
+            this.repoRoot,
+            this.buildLlmCallOpts(settings, "plan"),
+          );
+        } catch (err) {
+          throw new Error(`Plan retry failed: ${err}`);
+        }
+        totalLLMCalls++;
+        this.cb.onLog(
+          `[ralph] Plan retry finished in ${this.elapsed(retryStart)}`,
+        );
+        if (nextTaskContent.includes("<status>complete</status>")) {
+          this.cb.onLog(`[ralph] All tasks completed after ${iteration - 1} tasks.`);
+          this.completedEpic = true;
+          const statusData = await this.taskManager.readStatus();
+          statusData.tasks = statusData.tasks.filter((t) => t.status !== "backlog");
+          statusData.totalLLMCalls = totalLLMCalls;
+          await this.taskManager.writeStatus(statusData);
+          break;
+        }
+        synced = await this.persistPlanTaskList(nextTaskContent, "[ralph]");
+      }
+
+      // --- Parallel plan research sub-jobs (stretch, gated by dockerPlanParallel) ---
+      if (
+        this.dockerPool &&
+        settings.dockerPlanParallel &&
+        (settings.dockerPoolSize ?? 1) > 1
+      ) {
+        const researchPrompts = parseResearchPrompts(nextTaskContent);
+        if (researchPrompts.length > 0) {
+          this.cb.onLog(
+            `[system] Plan parallel: dispatching ${researchPrompts.length} research sub-job(s)…`,
+          );
+          const pool = this.dockerPool;
+          const subJobs = researchPrompts.map(async (prompt) => {
+            const slot = await pool.acquire();
+            if (slot === -1) return "";
+            try {
+              const epicBase =
+                settings.epicBaseBranch || (await this.gitManager.getCurrentBranch());
+              const worktreeBase = this.resolveWorktreeBase(settings, epicBase);
+              try {
+                await this.gitManager.createWorktree(slot, worktreeBase);
+              } catch {
+                // worktree creation is best-effort; continue even if it fails
+              }
+              return await this.llmCaller.call(
+                prompt,
+                settings.planModel,
+                this.repoRoot,
+                this.buildLlmCallOpts(settings, "plan", {
+                  containerIndex: slot,
+                  worktreeCwd: GitManager.worktreeContainerCwd(slot),
+                }),
+              );
+            } finally {
+              pool.release(slot);
+            }
+          });
+          const subResults = await Promise.all(subJobs);
+          totalLLMCalls += subResults.filter(Boolean).length;
+          for (const subOutput of subResults) {
+            if (!subOutput) continue;
+            const subTasks = parseJsonTaskList(subOutput);
+            if (subTasks.length > 0) {
+              await this.taskManager.syncBacklogTasks(subTasks);
+              this.cb.onLog(
+                `[system] Plan parallel: merged ${subTasks.length} task(s) from research sub-job`,
+              );
+            }
+          }
+        }
       }
 
       // Re-read task-status.json and always pick the first backlog task.
@@ -428,10 +730,78 @@ export class RalphLoop {
       const taskEntry = statusData.tasks.find((t) => t.status === "backlog");
 
       if (!taskEntry) {
-        this.cb.onLog("[system] Warning: no backlog task found after planning — skipping dev loop.");
+        this.cb.onLog("[ralph] Warning: no backlog task found after planning — skipping dev loop.");
         continue;
       }
 
+      // Pause after first planning phase if configured
+      if (iteration === 1 && settings.pauseAfterPlan) {
+        this.cb.onLog("[system] Paused after planning. Review the backlog and click Start to resume.");
+        break;
+      }
+
+      // --- Parallel dev/QA (when pool > 1 and parallel tasks enabled) ---
+      if (this.dockerPool && settings.dockerParallelTasks && (settings.dockerPoolSize ?? 1) > 1) {
+        const allBacklog = statusData.tasks.filter((t) => t.status === "backlog");
+        this.cb.onLog(
+          `[system] Parallel dispatch: ${allBacklog.length} backlog task(s), pool ${settings.dockerPoolSize}.`,
+        );
+
+        const inFlight: Promise<void>[] = [];
+        for (const bt of allBacklog) {
+          const pool = this.dockerPool;
+          if (!pool) break;
+          const slot = await pool.acquire();
+          if (slot === -1) break; // pool was stopped
+
+          const taskId = bt.id;
+          const taskTitle = bt.title;
+          const taskContent = `## Task: ${bt.title}\n\n${bt.description}`;
+          const worktreeCwd = GitManager.worktreeContainerCwd(slot);
+
+          // Create worktree for the slot (idempotent).
+          const epicBase = settings.epicBaseBranch || (await this.gitManager.getCurrentBranch());
+          const worktreeBase = this.resolveWorktreeBase(settings, epicBase);
+          try {
+            await this.gitManager.createWorktree(slot, worktreeBase);
+          } catch (err) {
+            this.cb.onLog(`[system] Warning: could not create worktree for slot ${slot}: ${err}`);
+          }
+
+          await this.withTaskLock(() =>
+            this.taskManager.setTaskStatus(taskId, "inProgress", totalLLMCalls, settings.maxLLMCalls),
+          );
+          await this.withTaskLock(() =>
+            this.taskManager.setNextTaskContent(taskId, taskContent),
+          );
+
+          const slotOpts = { containerIndex: slot, worktreeCwd };
+          const p = this.runDevQALoop(taskId, taskTitle, taskContent, totalLLMCalls, false, slotOpts)
+            .then(async (r) => {
+              totalLLMCalls = r.totalLLMCalls;
+              tasksSincePlan++;
+              await this.mergeSlotWorkBack({
+                settings,
+                slot,
+                worktreeBase,
+                epicBase,
+                taskId,
+                taskTitle,
+                totalLLMCalls,
+                maxLLMCalls: settings.maxLLMCalls,
+              });
+            })
+            .finally(() => pool.release(slot));
+
+          inFlight.push(p);
+        }
+
+        await this.logKanbanInFlight();
+        await Promise.all(inFlight);
+        continue;
+      }
+
+      // --- Sequential dev + QA (default path) ---
       const effectiveTaskId = taskEntry.id;
       const title = taskEntry.title;
       const effectiveTaskContent = `## Task: ${taskEntry.title}\n\n${taskEntry.description}`;
@@ -443,12 +813,6 @@ export class RalphLoop {
         settings.maxLLMCalls,
       );
       await this.taskManager.setNextTaskContent(effectiveTaskId, effectiveTaskContent);
-
-      // Pause after first planning phase if configured
-      if (iteration === 1 && settings.pauseAfterPlan) {
-        this.cb.onLog("[system] Paused after planning. Review the backlog and click Start to resume.");
-        break;
-      }
 
       // --- Dev + QA loop ---
       const devResult = await this.runDevQALoop(
@@ -468,6 +832,7 @@ export class RalphLoop {
     nextTaskContent: string,
     totalLLMCalls: number,
     startAtQa = false,
+    slotOpts?: { containerIndex?: number; worktreeCwd?: string },
   ): Promise<{ totalLLMCalls: number }> {
     let feedback = "";
     if (startAtQa) {
@@ -487,7 +852,7 @@ export class RalphLoop {
       if (totalLLMCalls >= s.maxLLMCalls) break;
 
       this.cb.onLog(
-        `[system] Dev iteration #${devIteration} for task #${effectiveTaskId}: ${title}`
+        `[ralph] Dev iteration #${devIteration} for task #${effectiveTaskId}: ${title}`
       );
 
       if (!startAtQa) {
@@ -501,10 +866,7 @@ export class RalphLoop {
             devPrompt,
             s.devModel,
             this.repoRoot,
-            {
-              agentBackend: s.agentBackend,
-              reasoningEffort: s.devReasoningEffort,
-            }
+            this.buildLlmCallOpts(s, "dev", slotOpts),
           );
         } catch (err) {
           throw new Error(`Dev phase failed: ${err}`);
@@ -512,28 +874,33 @@ export class RalphLoop {
         totalLLMCalls++;
         this.cb.onLog(`[dev] Dev agent finished in ${this.elapsed(devStart)}`);
 
-        // Log a summary (first 200 chars)
-        const summary = devOutput.slice(0, 200).replace(/\n/g, " ");
-        this.cb.onLog(`[dev] ${summary}${devOutput.length > 200 ? "..." : ""}`);
+        if (
+          !copilotAgentUsesJsonlLog(s.agentBackend, s.copilotOutputFormat)
+        ) {
+          const summary = devOutput.slice(0, 200).replace(/\n/g, " ");
+          this.cb.onLog(`[dev] ${summary}${devOutput.length > 200 ? "..." : ""}`);
+        }
 
         if (devOutput.includes("<status>blocked</status>")) {
           const blockedInfo = parseBlockedInfo(devOutput);
           const capturedAt = new Date().toISOString();
-          await this.taskManager.setTaskStatus(
-            effectiveTaskId,
-            "blocked",
-            totalLLMCalls,
-            s.maxLLMCalls,
-            "",
-            "",
-            devIteration,
-            {
-              summary: blockedInfo.summary,
-              impact: blockedInfo.impact,
-              nextStep: blockedInfo.nextStep,
-              needs: blockedInfo.needs,
-              capturedAt,
-            }
+          await this.withTaskLock(() =>
+            this.taskManager.setTaskStatus(
+              effectiveTaskId,
+              "blocked",
+              totalLLMCalls,
+              s.maxLLMCalls,
+              "",
+              "",
+              devIteration,
+              {
+                summary: blockedInfo.summary,
+                impact: blockedInfo.impact,
+                nextStep: blockedInfo.nextStep,
+                needs: blockedInfo.needs,
+                capturedAt,
+              }
+            ),
           );
           this.cb.onLog(
             `Task #${effectiveTaskId} BLOCKED in iteration #${devIteration}`
@@ -544,7 +911,7 @@ export class RalphLoop {
         // Respect limits between dev and QA calls.
         if (totalLLMCalls >= s.maxLLMCalls) {
           this.cb.onLog(
-            `[system] Max LLM calls reached (${totalLLMCalls}/${s.maxLLMCalls})`
+            `[ralph] Max LLM calls reached (${totalLLMCalls}/${s.maxLLMCalls})`
           );
           break;
         }
@@ -552,14 +919,16 @@ export class RalphLoop {
       startAtQa = false;
 
       // QA phase
-      await this.taskManager.setTaskStatus(
-        effectiveTaskId,
-        "inQa",
-        totalLLMCalls,
-        s.maxLLMCalls,
-        "",
-        "",
-        devIteration
+      await this.withTaskLock(() =>
+        this.taskManager.setTaskStatus(
+          effectiveTaskId,
+          "inQa",
+          totalLLMCalls,
+          s.maxLLMCalls,
+          "",
+          "",
+          devIteration
+        ),
       );
 
       const qaPrompt = await this.buildPrompt("qa-prompt.md", s, { task: nextTaskContent });
@@ -570,42 +939,49 @@ export class RalphLoop {
           qaPrompt,
           s.qaModel,
           this.repoRoot,
-          {
-            agentBackend: s.agentBackend,
-            reasoningEffort: s.qaReasoningEffort,
-          }
+          this.buildLlmCallOpts(s, "qa", slotOpts),
         );
       } catch (err) {
         throw new Error(`QA phase failed: ${err}`);
       }
       totalLLMCalls++;
       this.cb.onLog(`[qa] QA agent finished in ${this.elapsed(qaStart)}`);
-      await this.taskManager.setFeedbackContent(effectiveTaskId, feedback);
+      await this.withTaskLock(() =>
+        this.taskManager.setFeedbackContent(effectiveTaskId, feedback),
+      );
 
       if (feedback.includes("<status>verified</status>")) {
-        await this.taskManager.setTaskStatus(
-          effectiveTaskId,
-          "done",
-          totalLLMCalls,
-          s.maxLLMCalls,
-          "",
-          "",
-          devIteration
+        await this.withTaskLock(() =>
+          this.taskManager.setTaskStatus(
+            effectiveTaskId,
+            "done",
+            totalLLMCalls,
+            s.maxLLMCalls,
+            "",
+            "",
+            devIteration
+          ),
         );
         this.cb.onLog(`Task #${effectiveTaskId} verified!`);
-        await this.autoCommitTask(effectiveTaskId, title);
+        await this.autoCommitTask(effectiveTaskId, title, slotOpts?.worktreeCwd);
       } else {
-        await this.taskManager.setTaskStatus(
-          effectiveTaskId,
-          "inProgress",
-          totalLLMCalls,
-          s.maxLLMCalls,
-          "",
-          "",
-          devIteration
+        await this.withTaskLock(() =>
+          this.taskManager.setTaskStatus(
+            effectiveTaskId,
+            "inProgress",
+            totalLLMCalls,
+            s.maxLLMCalls,
+            "",
+            "",
+            devIteration
+          ),
         );
-        const fbSummary = feedback.slice(0, 120).replace(/\n/g, " ");
-        this.cb.onLog(`[qa] Feedback: ${fbSummary}...`);
+        if (
+          !copilotAgentUsesJsonlLog(s.agentBackend, s.copilotOutputFormat)
+        ) {
+          const fbSummary = feedback.slice(0, 120).replace(/\n/g, " ");
+          this.cb.onLog(`[qa] Feedback: ${fbSummary}...`);
+        }
       }
 
       devIteration++;
@@ -615,15 +991,24 @@ export class RalphLoop {
     return { totalLLMCalls };
   }
 
-  private async autoCommitTask(taskNum: number, title: string): Promise<void> {
+  private async autoCommitTask(taskNum: number, title: string, worktreeCwd?: string): Promise<void> {
     const settings = await this.settingsManager.read();
     if (!settings.autoCommit) return;
 
     try {
-      await this.gitManager.autoCommit(taskNum, title);
-      this.cb.onLog(`[system] Committed: Task #${taskNum} - ${title}`);
+      let hostCwd: string | undefined = undefined;
+      if (worktreeCwd) {
+        if (worktreeCwd.startsWith("/workspace")) {
+          // Map container-side /workspace path to host repoRoot path
+          hostCwd = path.join(this.repoRoot, worktreeCwd.replace(/^\/workspace\/?/, ""));
+        } else {
+          hostCwd = worktreeCwd;
+        }
+      }
+      await this.gitManager.autoCommit(taskNum, title, hostCwd);
+      this.cb.onLog(`[ralph] Committed: Task #${taskNum} - ${title}`);
     } catch (err) {
-      this.cb.onLog(`[system] Auto-commit failed: ${err}`);
+      this.cb.onLog(`[ralph] Auto-commit failed: ${err}`);
     }
   }
 
@@ -664,7 +1049,7 @@ export class RalphLoop {
 
   private async buildPrompt(
     templateName: string,
-    _settings: Settings,
+    settings: Settings,
     options?: { task?: string; feedback?: string }
   ): Promise<string> {
     const SEP = "\n---\n";
@@ -692,7 +1077,170 @@ export class RalphLoop {
     // Prompt template (already has its own heading)
     parts.push(await this.fileManager.read(templateName));
 
+    if (
+      templateName === "plan-prompt.md" &&
+      settings.useDocker &&
+      settings.dockerParallelTasks &&
+      (settings.dockerPoolSize ?? 1) > 1
+    ) {
+      const poolSize = settings.dockerPoolSize ?? 1;
+      const minBacklog = settings.minBacklogSize ?? 3;
+      parts.push(
+        `## Parallel Docker pool\n\n` +
+        `Ralph runs up to ${poolSize} backlog tasks concurrently in separate Docker containers. ` +
+        `When work remains, emit at least ${minBacklog} independent, non-overlapping backlog tasks in your JSON array ` +
+        `(ideally up to ${poolSize} tasks that can run in parallel without file conflicts). ` +
+        `A single backlog task uses only one container; multiple tasks are required to use the full pool.`,
+      );
+    }
+
     return parts.join(SEP);
+  }
+
+  private resolveWorktreeBase(settings: Settings, epicBase: string): string {
+    if (mergesPerTaskToEpicBase(settings)) {
+      return epicBase;
+    }
+    return settings.dockerWorkBranch || epicBase;
+  }
+
+  private resolveSlotMergeTarget(settings: Settings, epicBase: string): string {
+    if (mergesPerTaskToEpicBase(settings)) {
+      return epicBase;
+    }
+    return settings.dockerWorkBranch || epicBase;
+  }
+
+  private async mergeSlotWorkBack(args: {
+    settings: Settings;
+    slot: number;
+    worktreeBase: string;
+    epicBase: string;
+    taskId: number;
+    taskTitle: string;
+    totalLLMCalls: number;
+    maxLLMCalls: number;
+  }): Promise<void> {
+    const { settings, slot, worktreeBase, epicBase, taskId, taskTitle, totalLLMCalls, maxLLMCalls } =
+      args;
+    const mergeTarget = this.resolveSlotMergeTarget(settings, epicBase);
+    const perTaskToEpicBase = mergesPerTaskToEpicBase(settings);
+
+    if (perTaskToEpicBase && this.epicBaseMergePaused) {
+      this.cb.onLog(
+        `[system] Skipping merge for slot ${slot} (task #${taskId}): epic base merge paused after a prior conflict.`,
+      );
+      await this.blockTaskForMergeConflict(taskId, taskTitle, totalLLMCalls, maxLLMCalls, slot, mergeTarget, []);
+      return;
+    }
+
+    let result: { ok: boolean; conflicts?: string[] };
+    try {
+      result = await this.withTaskLock(() =>
+        this.gitManager.mergeWorktreeBranch(slot, worktreeBase, mergeTarget),
+      );
+    } catch (err) {
+      this.cb.onLog(
+        `[system] Warning: merge-back for slot ${slot} failed: ${err}. Resolve manually.`,
+      );
+      if (perTaskToEpicBase) {
+        this.epicBaseMergePaused = true;
+        await this.blockTaskForMergeConflict(taskId, taskTitle, totalLLMCalls, maxLLMCalls, slot, mergeTarget, []);
+      }
+      return;
+    }
+
+    if (result.ok) {
+      const targetLabel = perTaskToEpicBase ? "epic base" : "work branch";
+      this.cb.onLog(
+        `[system] Merged slot ${slot} into ${targetLabel}: ${worktreeBase}-slot-${slot} -> ${mergeTarget}`,
+      );
+      return;
+    }
+
+    const conflictList = (result.conflicts ?? []).join(", ") || "(unknown)";
+    this.cb.onLog(
+      `[system] Merge conflict for slot ${slot} into ${mergeTarget}. Conflicting files: ${conflictList}`,
+    );
+
+    if (perTaskToEpicBase) {
+      this.epicBaseMergePaused = true;
+      await this.blockTaskForMergeConflict(
+        taskId,
+        taskTitle,
+        totalLLMCalls,
+        maxLLMCalls,
+        slot,
+        mergeTarget,
+        result.conflicts ?? [],
+      );
+    }
+  }
+
+  private async blockTaskForMergeConflict(
+    taskId: number,
+    taskTitle: string,
+    totalLLMCalls: number,
+    maxLLMCalls: number,
+    slot: number,
+    mergeTarget: string,
+    conflicts: string[],
+  ): Promise<void> {
+    const conflictDetail =
+      conflicts.length > 0 ? ` Files: ${conflicts.join(", ")}.` : "";
+    await this.withTaskLock(() =>
+      this.taskManager.setTaskStatus(
+        taskId,
+        "blocked",
+        totalLLMCalls,
+        maxLLMCalls,
+        taskTitle,
+        "",
+        0,
+        {
+          summary: `Git merge conflict merging slot ${slot} into ${mergeTarget}`,
+          impact: `Task #${taskId} work could not be merged into the epic base branch.${conflictDetail}`,
+          nextStep:
+            "Resolve merge conflicts in the repository (complete or abort the merge), then restart the loop or mark the task resolved.",
+          needs: "Manual git conflict resolution",
+          capturedAt: new Date().toISOString(),
+        },
+      ),
+    );
+    this.cb.onLog(`[system] Task #${taskId} blocked due to merge conflict. Further epic-base merges are paused.`);
+  }
+
+  private async autoMergeOnFinish(runId: number): Promise<void> {
+    // Skip if a stop was requested for this run
+    if (this.stopRequestedRunId === runId || runId !== this.runGeneration) {
+      return;
+    }
+    const settings = await this.settingsManager.read();
+    const { useDocker, dockerAutoMergeEpicWork, epicBaseBranch, dockerWorkBranch } = settings;
+    if (
+      !useDocker ||
+      !usesWorkBranchStaging(settings) ||
+      !dockerAutoMergeEpicWork ||
+      !epicBaseBranch ||
+      !dockerWorkBranch ||
+      epicBaseBranch === dockerWorkBranch
+    ) {
+      return;
+    }
+    try {
+      await this.gitManager.createOrCheckoutBranch(epicBaseBranch, epicBaseBranch);
+      const result = await this.gitManager.mergeWorkBranch(dockerWorkBranch, "no-ff");
+      if (result.ok) {
+        this.cb.onLog(`[system] Merged work branch into epic base: ${dockerWorkBranch} -> ${epicBaseBranch}`);
+      } else {
+        const conflictList = (result.conflicts ?? []).join(", ") || "(unknown)";
+        this.cb.onLog(
+          `[system] Auto-merge conflicts — resolve manually and use Merge work into epic branch. Conflicting files: ${conflictList}`,
+        );
+      }
+    } catch (err) {
+      this.cb.onLog(`[system] Auto-merge failed: ${String(err)}`);
+    }
   }
 
   private finishRun(runId: number, err?: Error): void {
@@ -709,12 +1257,12 @@ export class RalphLoop {
 
     if (err) {
       this.cb.onLoopStatus("error", err.message);
-      this.cb.onLog(`[system] Loop error: ${err.message}`);
+      this.cb.onLog(`[ralph] Loop error: ${err.message}`);
       return;
     }
 
     this.cb.onLoopStatus("idle", null);
-    this.cb.onLog("[system] Ralph loop finished");
+    this.cb.onLog("[ralph] Ralph loop finished");
   }
 
   private async waitForIdle(): Promise<void> {
